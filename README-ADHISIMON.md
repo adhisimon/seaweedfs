@@ -24,7 +24,6 @@ podman pull ghcr.io/adhisimon/seaweedfs:latest
 
 ## Tags
 I will try to build this tags consistently:
-- dev
-- release version, eg: 4.18
+- dev (from master branch)
+- latest release version, eg: 4.18
 - latest (will sync with latest release version)
-
