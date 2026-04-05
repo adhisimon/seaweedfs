@@ -27,6 +27,8 @@ so I know that someone else use my build.
 
 ## Tags
 I will try to build this tags consistently:
-- dev (from master branch)
+- dev from master branch, beware,
+  I don't know if master branch snapshot is stable enough.
+  Personally, I just use it for testing something on Admin UI.
 - latest release version, eg: 4.18
-- latest (will sync with latest release version)
+- latest, will sync with latest release version
