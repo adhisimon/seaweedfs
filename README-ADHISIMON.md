@@ -22,6 +22,9 @@ or
 podman pull ghcr.io/adhisimon/seaweedfs:latest
 ```
 
+If you use my build, please star this repository
+so I know that someone else use my build.
+
 ## Tags
 I will try to build this tags consistently:
 - dev (from master branch)
