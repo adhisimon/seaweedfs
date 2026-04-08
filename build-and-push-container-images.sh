@@ -46,7 +46,7 @@ git branch
 
 echo '[*] Build and push "release" image tag (also update latest tag to it)'
 (
-    make clean && \
+    make clean;
     make build && \
     podman push localhost/chrislusf/seaweedfs:local ${REMOTE_IMAGE}:${NEWEST_VERSION} && \
     podman push localhost/chrislusf/seaweedfs:local ${REMOTE_IMAGE}:latest \
@@ -58,7 +58,7 @@ git checkout master
 echo '[*] Build and push "dev" image tag'
 cd docker
 (
-    make clean && \
+    make clean;
     make build && \
     podman push localhost/chrislusf/seaweedfs:local ${REMOTE_IMAGE}:dev \
 ) || ( echo '[!] Failed to build and push dev image tag'; exit 1 )
