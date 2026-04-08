@@ -35,14 +35,6 @@ git merge -m "Merge remote-tracking branch 'upstream/master'" upstream/master ||
 echo '[*] Pushing merges to origin'
 git push || ( echo '[!] Failed on pushing merges to origin'; exit 1 )
 
-echo '[*] Build and push "dev" image tag'
-cd docker
-(
-    make clean && \
-    make build && \
-    podman push localhost/chrislusf/seaweedfs:local ${REMOTE_IMAGE}:dev \
-) || ( echo '[!] Failed to build and push dev image tag'; exit 1 )
-
 echo '[*] Getting know what is the newest version'
 NEWEST_VERSION=`git tag|grep '^[0-9]'|tail -n1`
 
@@ -60,7 +52,15 @@ echo '[*] Build and push "release" image tag (also update latest tag to it)'
     podman push localhost/chrislusf/seaweedfs:local ${REMOTE_IMAGE}:latest \
 ) || ( echo '[!] Failed to build and push release/latest image tag'; exit 1 )
 
-echo '[*] Back to master branch'
+echo '[*] Back to master branch to update "dev" image tag'
 git checkout master
+
+echo '[*] Build and push "dev" image tag'
+cd docker
+(
+    make clean && \
+    make build && \
+    podman push localhost/chrislusf/seaweedfs:local ${REMOTE_IMAGE}:dev \
+) || ( echo '[!] Failed to build and push dev image tag'; exit 1 )
 
 echo '[*] Finished'
