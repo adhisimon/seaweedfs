@@ -32,3 +32,5 @@ I will try to build this tags consistently:
   Personally, I just use it for testing something on Admin UI.
 - latest release version, eg: 4.18
 - latest, will sync with latest release version
+
+See this [github package page](https://github.com/adhisimon/seaweedfs/pkgs/container/seaweedfs) to see all available tags.
