@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -64,31 +65,46 @@ func RunShell(options ShellOptions) {
 			}
 			return nil
 		})
-		fmt.Printf("master: %s ", *options.Masters)
+		fmt.Fprintf(os.Stderr, "master: %s ", *options.Masters)
 		if len(filers) > 0 {
-			fmt.Printf("filers: %v", filers)
+			fmt.Fprintf(os.Stderr, "filers: %v", filers)
 			commandEnv.option.FilerAddress = filers[rand.IntN(len(filers))]
 		}
-		fmt.Println()
+		fmt.Fprintln(os.Stderr)
 	}
 
-	for {
-		cmd, err := line.Prompt("> ")
-		if err != nil {
-			if err != io.EOF {
-				fmt.Printf("%v\n", err)
-			}
-			return
-		}
-
-		if strings.TrimSpace(cmd) != "" {
-			line.AppendHistory(cmd)
-		}
-
-		for _, c := range util.StringSplit(cmd, ";") {
-			if processEachCmd(c, commandEnv) {
+	if liner.TerminalSupported() {
+		for {
+			cmd, err := line.Prompt("> ")
+			if err != nil {
+				if err != io.EOF {
+					fmt.Fprintf(os.Stderr, "%v\n", err)
+				}
 				return
 			}
+
+			if strings.TrimSpace(cmd) != "" {
+				line.AppendHistory(cmd)
+			}
+
+			for _, c := range util.StringSplit(cmd, ";") {
+				if processEachCmd(c, commandEnv) {
+					return
+				}
+			}
+		}
+	} else {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			cmd := scanner.Text()
+			for _, c := range util.StringSplit(cmd, ";") {
+				if processEachCmd(c, commandEnv) {
+					return
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "error reading stdin: %v\n", err)
 		}
 	}
 }
@@ -186,6 +202,9 @@ func printGenericHelp() {
 	fmt.Print(msg)
 
 	for _, c := range Commands {
+		if c.HasTag(Hidden) {
+			continue
+		}
 		helpTexts := strings.SplitN(c.Help(), "\n", 2)
 		fmt.Printf("  %-30s\t# %s \n", c.Name(), helpTexts[0])
 	}
@@ -229,10 +248,10 @@ func loadHistory() {
 
 func saveHistory() {
 	if f, err := os.Create(historyPath); err != nil {
-		fmt.Printf("Error creating history file: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error creating history file: %v\n", err)
 	} else {
 		if _, err = line.WriteHistory(f); err != nil {
-			fmt.Printf("Error writing history file: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error writing history file: %v\n", err)
 		}
 		f.Close()
 	}
