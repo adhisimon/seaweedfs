@@ -38,6 +38,8 @@ git push || ( echo '[!] Failed on pushing merges to origin'; exit 1 )
 echo '[*] Getting know what is the newest version'
 NEWEST_VERSION=`git tag|grep '^[0-9]'|tail -n1`
 
+cd docker
+
 echo '[*] Change to newest tag: ' ${NEWEST_VERSION}
 git checkout ${NEWEST_VERSION} || ( echo '[!] Failed to change to newest tag'; exit 1 )
 
@@ -46,7 +48,7 @@ git branch
 
 echo '[*] Build and push "release" image tag (also update latest tag to it)'
 (
-    make clean;
+    make clean && \
     make build && \
     podman push localhost/chrislusf/seaweedfs:local ${REMOTE_IMAGE}:${NEWEST_VERSION} && \
     podman push localhost/chrislusf/seaweedfs:local ${REMOTE_IMAGE}:latest \
@@ -56,9 +58,8 @@ echo '[*] Back to master branch to update "dev" image tag'
 git checkout master
 
 echo '[*] Build and push "dev" image tag'
-cd docker
 (
-    make clean;
+    make clean && \
     make build && \
     podman push localhost/chrislusf/seaweedfs:local ${REMOTE_IMAGE}:dev \
 ) || ( echo '[!] Failed to build and push dev image tag'; exit 1 )
