@@ -99,6 +99,7 @@ type (
 	iamPutUserPolicyResponse            = iamlib.PutUserPolicyResponse
 	iamDeleteUserPolicyResponse         = iamlib.DeleteUserPolicyResponse
 	iamGetUserPolicyResponse            = iamlib.GetUserPolicyResponse
+	iamListUserPoliciesResponse         = iamlib.ListUserPoliciesResponse
 	iamAttachUserPolicyResponse         = iamlib.AttachUserPolicyResponse
 	iamDetachUserPolicyResponse         = iamlib.DetachUserPolicyResponse
 	iamListAttachedUserPoliciesResponse = iamlib.ListAttachedUserPoliciesResponse
@@ -124,6 +125,10 @@ type (
 	iamAttachGroupPolicyResponse         = iamlib.AttachGroupPolicyResponse
 	iamDetachGroupPolicyResponse         = iamlib.DetachGroupPolicyResponse
 	iamListAttachedGroupPoliciesResponse = iamlib.ListAttachedGroupPoliciesResponse
+	iamPutGroupPolicyResponse            = iamlib.PutGroupPolicyResponse
+	iamGetGroupPolicyResponse            = iamlib.GetGroupPolicyResponse
+	iamDeleteGroupPolicyResponse         = iamlib.DeleteGroupPolicyResponse
+	iamListGroupPoliciesResponse         = iamlib.ListGroupPoliciesResponse
 	iamListGroupsForUserResponse         = iamlib.ListGroupsForUserResponse
 )
 
@@ -933,6 +938,23 @@ func (e *EmbeddedIamApi) DeleteUserPolicy(s3cfg *iam_pb.S3ApiConfiguration, valu
 	for _, ident := range s3cfg.Identities {
 		if ident.Name == userName {
 			ident.Actions = nil
+			return resp, nil
+		}
+	}
+	return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf(iamUserDoesNotExist, userName)}
+}
+
+// ListUserPolicies lists the names of inline policies attached to a user.
+// https://docs.aws.amazon.com/IAM/latest/APIReference/API_ListUserPolicies.html
+func (e *EmbeddedIamApi) ListUserPolicies(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) (*iamListUserPoliciesResponse, *iamError) {
+	resp := &iamListUserPoliciesResponse{}
+	userName := values.Get("UserName")
+	for _, ident := range s3cfg.Identities {
+		if ident.Name == userName {
+			if len(ident.Actions) > 0 {
+				resp.ListUserPoliciesResult.PolicyNames = []string{userName + "_policy"}
+			}
+			resp.ListUserPoliciesResult.IsTruncated = false
 			return resp, nil
 		}
 	}
@@ -1753,6 +1775,31 @@ func (e *EmbeddedIamApi) ListGroupsForUser(s3cfg *iam_pb.S3ApiConfiguration, val
 	return resp, nil
 }
 
+// notImplementedError returns a NotImplemented IAM error for the embedded server.
+func notImplementedGroupInlineError() *iamError {
+	return &iamError{Code: s3err.GetAPIError(s3err.ErrNotImplemented).Code, Error: fmt.Errorf("group inline policies are not supported in embedded IAM mode; use the standalone IAM server or managed policies (AttachGroupPolicy)")}
+}
+
+// PutGroupPolicy is not supported in embedded IAM mode.
+func (e *EmbeddedIamApi) PutGroupPolicy(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) (*iamPutGroupPolicyResponse, *iamError) {
+	return &iamPutGroupPolicyResponse{}, notImplementedGroupInlineError()
+}
+
+// GetGroupPolicy is not supported in embedded IAM mode.
+func (e *EmbeddedIamApi) GetGroupPolicy(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) (*iamGetGroupPolicyResponse, *iamError) {
+	return &iamGetGroupPolicyResponse{}, notImplementedGroupInlineError()
+}
+
+// DeleteGroupPolicy is not supported in embedded IAM mode.
+func (e *EmbeddedIamApi) DeleteGroupPolicy(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) (*iamDeleteGroupPolicyResponse, *iamError) {
+	return &iamDeleteGroupPolicyResponse{}, notImplementedGroupInlineError()
+}
+
+// ListGroupPolicies is not supported in embedded IAM mode.
+func (e *EmbeddedIamApi) ListGroupPolicies(s3cfg *iam_pb.S3ApiConfiguration, values url.Values) (*iamListGroupPoliciesResponse, *iamError) {
+	return &iamListGroupPoliciesResponse{}, notImplementedGroupInlineError()
+}
+
 // handleImplicitUsername adds username who signs the request to values if 'username' is not specified.
 // According to AWS documentation: "If you do not specify a user name, IAM determines the user name
 // implicitly based on the Amazon Web Services access key ID signing the request."
@@ -1906,8 +1953,8 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 	action := values.Get("Action")
 	if e.readOnly {
 		switch action {
-		case "ListUsers", "ListAccessKeys", "GetUser", "GetUserPolicy", "ListAttachedUserPolicies", "ListPolicies", "GetPolicy", "ListPolicyVersions", "GetPolicyVersion", "ListServiceAccounts", "GetServiceAccount",
-			"GetGroup", "ListGroups", "ListAttachedGroupPolicies", "ListGroupsForUser":
+		case "ListUsers", "ListAccessKeys", "GetUser", "GetUserPolicy", "ListUserPolicies", "ListAttachedUserPolicies", "ListPolicies", "GetPolicy", "ListPolicyVersions", "GetPolicyVersion", "ListServiceAccounts", "GetServiceAccount",
+			"GetGroup", "ListGroups", "ListAttachedGroupPolicies", "GetGroupPolicy", "ListGroupPolicies", "ListGroupsForUser":
 			// Allowed read-only actions
 		default:
 			return nil, &iamError{Code: s3err.GetAPIError(s3err.ErrAccessDenied).Code, Error: fmt.Errorf("IAM write operations are disabled on this server")}
@@ -2003,6 +2050,13 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 		if iamErr != nil {
 			return nil, iamErr
 		}
+	case "ListUserPolicies":
+		var iamErr *iamError
+		response, iamErr = e.ListUserPolicies(s3cfg, values)
+		if iamErr != nil {
+			return nil, iamErr
+		}
+		changed = false
 	case "AttachUserPolicy":
 		var iamErr *iamError
 		response, iamErr = e.AttachUserPolicy(ctx, values)
@@ -2154,6 +2208,34 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 			return nil, iamErr
 		}
 		changed = false
+	case "PutGroupPolicy":
+		var iamErr *iamError
+		response, iamErr = e.PutGroupPolicy(s3cfg, values)
+		if iamErr != nil {
+			return nil, iamErr
+		}
+		changed = false
+	case "GetGroupPolicy":
+		var iamErr *iamError
+		response, iamErr = e.GetGroupPolicy(s3cfg, values)
+		if iamErr != nil {
+			return nil, iamErr
+		}
+		changed = false
+	case "DeleteGroupPolicy":
+		var iamErr *iamError
+		response, iamErr = e.DeleteGroupPolicy(s3cfg, values)
+		if iamErr != nil {
+			return nil, iamErr
+		}
+		changed = false
+	case "ListGroupPolicies":
+		var iamErr *iamError
+		response, iamErr = e.ListGroupPolicies(s3cfg, values)
+		if iamErr != nil {
+			return nil, iamErr
+		}
+		changed = false
 	case "ListGroupsForUser":
 		var iamErr *iamError
 		response, iamErr = e.ListGroupsForUser(s3cfg, values)
@@ -2198,7 +2280,7 @@ func (e *EmbeddedIamApi) DoActions(w http.ResponseWriter, r *http.Request) {
 
 	// Handle implicit username for HTTP requests
 	switch r.Form.Get("Action") {
-	case "ListAccessKeys", "CreateAccessKey", "DeleteAccessKey", "UpdateAccessKey":
+	case "ListAccessKeys", "CreateAccessKey", "DeleteAccessKey", "UpdateAccessKey", "ListUserPolicies":
 		e.handleImplicitUsername(r, values)
 	case "CreateServiceAccount":
 		createdBy := s3_constants.GetIdentityNameFromContext(r)
