@@ -40,28 +40,28 @@ var (
 )
 
 type Filer struct {
-	UniqueFilerId       int32
-	UniqueFilerEpoch    int32
-	Store               VirtualFilerStore
-	MasterClient        *wdclient.MasterClient
-	fileIdDeletionQueue *util.UnboundedQueue
-	GrpcDialOption      grpc.DialOption
-	DirBucketsPath      string
-	Cipher              bool
-	LocalMetaLogBuffer  *log_buffer.LogBuffer
-	metaLogCollection   string
-	metaLogReplication  string
-	MetaAggregator      *MetaAggregator
-	Signature           int32
-	FilerConf           *FilerConf
-	RemoteStorage       *FilerRemoteStorage
-	lazyFetchGroup      singleflight.Group
-	lazyListGroup       singleflight.Group
-	Dlm                 *lock_manager.DistributedLockManager
-	MaxFilenameLength   uint32
-	deletionQuit        chan struct{}
-	DeletionRetryQueue  *DeletionRetryQueue
-	EmptyFolderCleaner       *empty_folder_cleanup.EmptyFolderCleaner
+	UniqueFilerId           int32
+	UniqueFilerEpoch        int32
+	Store                   VirtualFilerStore
+	MasterClient            *wdclient.MasterClient
+	fileIdDeletionQueue     *util.UnboundedQueue
+	GrpcDialOption          grpc.DialOption
+	DirBucketsPath          string
+	Cipher                  bool
+	LocalMetaLogBuffer      *log_buffer.LogBuffer
+	metaLogCollection       string
+	metaLogReplication      string
+	MetaAggregator          *MetaAggregator
+	Signature               int32
+	FilerConf               *FilerConf
+	RemoteStorage           *FilerRemoteStorage
+	lazyFetchGroup          singleflight.Group
+	lazyListGroup           singleflight.Group
+	Dlm                     *lock_manager.DistributedLockManager
+	MaxFilenameLength       uint32
+	deletionQuit            chan struct{}
+	DeletionRetryQueue      *DeletionRetryQueue
+	EmptyFolderCleaner      *empty_folder_cleanup.EmptyFolderCleaner
 	EmptyFolderCleanupDelay time.Duration
 }
 
@@ -82,7 +82,13 @@ func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerH
 		f.UniqueFilerId = -f.UniqueFilerId
 	}
 
-	f.LocalMetaLogBuffer = log_buffer.NewLogBuffer("local", LogFlushInterval, f.logFlushFunc, f.readPersistedLogBufferPosition, notifyFn)
+	// ReadFromDiskFn is intentionally nil here.  SubscribeLocalMetadata already
+	// manages disk reads explicitly with shouldReadFromDisk / lastCheckedFlushTsNs
+	// tracking.  Setting ReadFromDiskFn would cause LoopProcessLogData to issue a
+	// redundant ReadPersistedLogBuffer call (ListDirectoryEntries + readahead
+	// goroutine) on every 250ms health-check tick when a subscriber encounters
+	// ResumeFromDiskError, adding significant CPU and GC pressure even when idle.
+	f.LocalMetaLogBuffer = log_buffer.NewLogBuffer("local", LogFlushInterval, f.logFlushFunc, nil, notifyFn)
 	f.metaLogCollection = collection
 	f.metaLogReplication = replication
 

@@ -703,7 +703,6 @@ func uniqueName(prefix string) string {
 
 // --- Test setup helpers ---
 
-
 func startMiniCluster(t *testing.T) (*TestCluster, error) {
 	ports := testutil.MustAllocatePorts(t, 8)
 	masterPort, masterGrpcPort := ports[0], ports[1]
@@ -733,10 +732,12 @@ func startMiniCluster(t *testing.T) (*TestCluster, error) {
 	err := os.WriteFile(securityToml, []byte("# Empty security config\n"), 0644)
 	require.NoError(t, err)
 
-	// Configure credential store for IAM tests
+	// Configure credential store for IAM tests.
+	// Use filer_etc instead of memory because the memory store does not
+	// persist groups or service accounts through LoadConfiguration/SaveConfiguration.
 	credentialToml := filepath.Join(testDir, "credential.toml")
 	credentialConfig := `
-[credential.memory]
+[credential.filer_etc]
 enabled = true
 `
 	err = os.WriteFile(credentialToml, []byte(credentialConfig), 0644)
@@ -805,7 +806,6 @@ enabled = true
 	cluster.isRunning = true
 	return cluster, nil
 }
-
 
 // startRustVolumeServer starts a Rust volume server that registers with the same master.
 func (c *TestCluster) startRustVolumeServer(t *testing.T) error {

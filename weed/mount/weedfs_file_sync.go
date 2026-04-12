@@ -144,6 +144,13 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.S
 		return fuse.OK
 	}
 
+	// Skip metadata flush if the file was unlinked while open.
+	// The filer entry is already gone; flushing would recreate it.
+	if fh.isDeleted {
+		glog.V(3).Infof("doFlush %s fh %d: file was unlinked, skipping metadata flush", fileFullPath, fh.fh)
+		return fuse.OK
+	}
+
 	if isOverQuota {
 		return fuse.Status(syscall.ENOSPC)
 	}
@@ -189,7 +196,11 @@ func (wfs *WFS) flushMetadataToFiler(fh *FileHandle, dir, name string, uid, gid 
 		if entry.Attributes.Gid == 0 {
 			entry.Attributes.Gid = gid
 		}
-		entry.Attributes.Mtime = time.Now().Unix()
+		flushNow := time.Now()
+		entry.Attributes.Mtime = flushNow.Unix()
+		entry.Attributes.MtimeNs = int32(flushNow.Nanosecond())
+		entry.Attributes.Ctime = flushNow.Unix()
+		entry.Attributes.CtimeNs = int32(flushNow.Nanosecond())
 	}
 
 	glog.V(4).Infof("%s set chunks: %v", fileFullPath, len(entry.GetChunks()))

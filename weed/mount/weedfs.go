@@ -63,9 +63,9 @@ type Option struct {
 	MountMtime       time.Time
 	MountParentInode uint64
 
-	VolumeServerAccess string // how to access volume servers
-	Cipher             bool   // whether encrypt data on volume server
-	UidGidMapper       *meta_cache.UidGidMapper
+	VolumeServerAccess   string // how to access volume servers
+	Cipher               bool   // whether encrypt data on volume server
+	UidGidMapper         *meta_cache.UidGidMapper
 	IncludeSystemEntries bool
 
 	// Periodic metadata flush interval in seconds (0 to disable)
@@ -92,6 +92,12 @@ type Option struct {
 	// WritebackCache enables async flush on close for improved small file write performance.
 	// When true, Flush() returns immediately and data upload + metadata flush happen in background.
 	WritebackCache bool
+
+	// PosixDirNlink enables POSIX-compliant directory nlink counting
+	// (nlink = 2 + number_of_subdirectories). This requires listing
+	// cached directory entries on every stat, which has a performance cost.
+	// When false (default), directories report nlink=2.
+	PosixDirNlink bool
 
 	uniqueCacheDirForRead  string
 	uniqueCacheDirForWrite string
@@ -123,9 +129,16 @@ type WFS struct {
 	filerClient          *wdclient.FilerClient // Cached volume location client
 	refreshMu            sync.Mutex
 	refreshingDirs       map[util.FullPath]struct{}
+	atimeMu              sync.Mutex
+	atimeMap             map[uint64]time.Time // inode -> atime, in-memory only, bounded
+	dirMtimeMu           sync.Mutex
+	dirMtimeMap          map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
+	entryValidSec        uint64 // kernel FUSE entry cache TTL in seconds
+	attrValidSec         uint64 // kernel FUSE attr cache TTL in seconds
 	dirHotWindow         time.Duration
 	dirHotThreshold      int
 	dirIdleEvict         time.Duration
+	fileIdPool           *FileIdPool
 
 	// asyncFlushWg tracks pending background flush work items for writebackCache mode.
 	// Must be waited on before unmount cleanup to prevent data loss.
@@ -202,14 +215,28 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		fhLockTable:       util.NewLockTable[FileHandleId](),
 		posixLocks:        NewPosixLockTable(),
 		refreshingDirs:    make(map[util.FullPath]struct{}),
+		atimeMap:          make(map[uint64]time.Time, 8192),
+		dirMtimeMap:       make(map[uint64]time.Time, 1024),
+		entryValidSec:    1,
+		attrValidSec:     1,
 		dirHotWindow:      dirHotWindow,
 		dirHotThreshold:   dirHotThreshold,
 		dirIdleEvict:      dirIdleEvict,
 	}
 
-	if option.EnableDistributedLock && len(option.FilerAddresses) > 0 {
+	// With writeback caching, this mount is the single writer. Increase kernel
+	// FUSE cache TTLs so the kernel doesn't re-issue Lookup/GetAttr for every
+	// path component and stat — the local meta cache is authoritative.
+	if option.WritebackCache {
+		wfs.entryValidSec = 10
+		wfs.attrValidSec = 10
+	}
+
+	if option.EnableDistributedLock && !option.WritebackCache && len(option.FilerAddresses) > 0 {
 		wfs.lockClient = cluster.NewLockClient(option.GrpcDialOption, option.FilerAddresses[0])
 		glog.V(0).Infof("distributed lock manager enabled for mount")
+	} else if option.EnableDistributedLock && option.WritebackCache {
+		glog.V(0).Infof("distributed lock manager disabled: writeback cache implies single-writer mode")
 	}
 
 	wfs.option.filerIndex = int32(rand.IntN(len(option.FilerAddresses)))
@@ -330,7 +357,7 @@ func (wfs *WFS) StartBackgroundTasks() error {
 	}
 
 	startTime := time.Now()
-	go meta_cache.SubscribeMetaEvents(wfs.metaCache, wfs.signature, wfs, wfs.option.FilerMountRootPath, startTime.UnixNano(), func(lastTsNs int64, err error) {
+	go meta_cache.SubscribeMetaEvents(wfs.metaCache, wfs.signature, wfs, wfs.option.FilerMountRootPath, startTime.UnixNano(), wfs.option.WritebackCache, func(lastTsNs int64, err error) {
 		glog.Warningf("meta events follow retry from %v: %v", time.Unix(0, lastTsNs), err)
 		if deleteErr := wfs.metaCache.DeleteFolderChildren(context.Background(), util.FullPath(wfs.option.FilerMountRootPath)); deleteErr != nil {
 			glog.Warningf("meta cache cleanup failed: %v", deleteErr)
@@ -340,6 +367,11 @@ func (wfs *WFS) StartBackgroundTasks() error {
 	go wfs.loopCheckQuota()
 	go wfs.loopFlushDirtyMetadata()
 	go wfs.loopEvictIdleDirCache()
+
+	if wfs.option.WritebackCache {
+		wfs.fileIdPool = NewFileIdPool(wfs)
+		glog.V(0).Infof("file ID pool enabled for writeback cache (batch=%d)", wfs.fileIdPool.batchSize)
+	}
 
 	return nil
 }
