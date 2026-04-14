@@ -46,7 +46,7 @@ git checkout ${NEWEST_VERSION} || ( echo '[!] Failed to change to newest tag'; e
 echo '[*] We are on this branch/tag right now:';
 git branch
 
-echo '[*] Build and push "release" image tag (also update latest tag to it)'
+echo '[*] Build and push "release"' ${NEWEST_VERSION} 'image tag (also update latest tag to it)'
 (
     make clean && \
     make build && \
