@@ -38,7 +38,7 @@ git push || ( echo '[!] Failed on pushing merges to origin'; exit 1 )
 echo '[*] Getting know what is the newest version'
 NEWEST_VERSION=`git tag|grep '^[0-9]'|tail -n1`
 
-SHOULD_BUILD_RELEASE_TAG=Y
+SHOULD_BUILD_RELEASE_TAG="Y"
 
 if [ ! -d "build" ]; then
     mkdir -v build
@@ -48,11 +48,12 @@ if [ -f "build/.latest_successful_release_container_build" ]: then
     LATEST_SUCCESSFUL_RELEASE_CONTAINER_BUILD=$(< build/.latest_successful_release_container_build)
 
     if [[ "${NEWEST_VERSION}" == "${LATEST_SUCCESSFUL_RELEASE_CONTAINER_BUILD}" ]]; then
-        SHOULD_BUILD_RELEASE_TAG=N
+        echo '[*] No need to rebuild container image release tag'
+        SHOULD_BUILD_RELEASE_TAG="N"
     fi
 fi
 
-if [[ ${SHOULD_BUILD_RELEASE_TAG} == 'Y' ]]; then
+if [[ ${SHOULD_BUILD_RELEASE_TAG} == "Y" ]]; then
     echo '[*] Change to newest tag: ' ${NEWEST_VERSION}
     git checkout ${NEWEST_VERSION} || ( echo '[!] Failed to change to newest tag'; exit 1 )
 
