@@ -53,14 +53,14 @@ if [ -f "build/.latest_successful_release_container_build" ]; then
     fi
 fi
 
+cd ${SCRIPT_DIR}/docker || ( echo '[!] Failed to change working directory to docker'; exit 1 )
+
 if [[ ${SHOULD_BUILD_RELEASE_TAG} == "Y" ]]; then
     echo '[*] Change to newest tag: ' ${NEWEST_VERSION}
     git checkout ${NEWEST_VERSION} || ( echo '[!] Failed to change to newest tag'; exit 1 )
 
     echo '[*] We are on this branch/tag right now:';
     git branch
-
-    cd ${SCRIPT_DIR}/docker || ( echo '[!] Failed to change working directory to docker'; exit 1 )
 
     echo '[*] Build and push "release"' ${NEWEST_VERSION} 'image tag (also update latest tag to it)'
     (
