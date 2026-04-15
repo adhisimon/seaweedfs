@@ -41,13 +41,13 @@ NEWEST_VERSION=`git tag|grep '^[0-9]'|tail -n1`
 SHOULD_BUILD_RELEASE_TAG=Y
 
 if [ ! -d "build" ]; then
-    mkdir -fv build
+    mkdir -v build
 fi
 
 if [ -f "build/.latest_successful_release_container_build" ]: then
     LATEST_SUCCESSFUL_RELEASE_CONTAINER_BUILD=$(< build/.latest_successful_release_container_build)
 
-    if [[ "${NEWEST_VERSION}" == "${LATEST_SUCCESSFUL_RELEASE_CONTAINER_BUILD}"]]; then
+    if [[ "${NEWEST_VERSION}" == "${LATEST_SUCCESSFUL_RELEASE_CONTAINER_BUILD}" ]]; then
         SHOULD_BUILD_RELEASE_TAG=N
     fi
 fi
