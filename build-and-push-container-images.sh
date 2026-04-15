@@ -44,7 +44,7 @@ if [ ! -d "build" ]; then
     mkdir -v build
 fi
 
-if [ -f "build/.latest_successful_release_container_build" ]: then
+if [ -f "build/.latest_successful_release_container_build" ]; then
     LATEST_SUCCESSFUL_RELEASE_CONTAINER_BUILD=$(< build/.latest_successful_release_container_build)
 
     if [[ "${NEWEST_VERSION}" == "${LATEST_SUCCESSFUL_RELEASE_CONTAINER_BUILD}" ]]; then
