@@ -38,7 +38,7 @@ git push || ( echo '[!] Failed on pushing merges to origin'; exit 1 )
 echo '[*] Getting know what is the newest version'
 NEWEST_VERSION=`git tag|grep '^[0-9]'|tail -n1`
 
-cd docker
+cd ${SCRIPT_DIR}/docker || ( echo '[!] Failed to change working directory to docker'; exit 1 )
 
 echo '[*] Change to newest tag: ' ${NEWEST_VERSION}
 git checkout ${NEWEST_VERSION} || ( echo '[!] Failed to change to newest tag'; exit 1 )
