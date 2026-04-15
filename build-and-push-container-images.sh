@@ -38,23 +38,41 @@ git push || ( echo '[!] Failed on pushing merges to origin'; exit 1 )
 echo '[*] Getting know what is the newest version'
 NEWEST_VERSION=`git tag|grep '^[0-9]'|tail -n1`
 
-cd ${SCRIPT_DIR}/docker || ( echo '[!] Failed to change working directory to docker'; exit 1 )
+SHOULD_BUILD_RELEASE_TAG=Y
 
-echo '[*] Change to newest tag: ' ${NEWEST_VERSION}
-git checkout ${NEWEST_VERSION} || ( echo '[!] Failed to change to newest tag'; exit 1 )
+if [ ! -d "build" ]; then
+    mkdir -fv build
+fi
 
-echo '[*] We are on this branch/tag right now:';
-git branch
+if [ -f "build/.latest_successful_release_container_build" ]: then
+    LATEST_SUCCESSFUL_RELEASE_CONTAINER_BUILD=$(< build/.latest_successful_release_container_build)
 
-echo '[*] Build and push "release"' ${NEWEST_VERSION} 'image tag (also update latest tag to it)'
-(
-    make clean && \
-    make build && \
-    podman push localhost/chrislusf/seaweedfs:local ${REMOTE_IMAGE}:${NEWEST_VERSION} && \
-    podman push localhost/chrislusf/seaweedfs:local ${REMOTE_IMAGE}:latest \
-) || ( echo '[!] Failed to build and push release/latest image tag'; exit 1 )
+    if [[ "${NEWEST_VERSION}" == "${LATEST_SUCCESSFUL_RELEASE_CONTAINER_BUILD}"]]; then
+        SHOULD_BUILD_RELEASE_TAG=N
+    fi
+fi
 
-echo '[*] Back to master branch to update "dev" image tag'
+if [[ ${SHOULD_BUILD_RELEASE_TAG} == 'Y' ]]; then
+    echo '[*] Change to newest tag: ' ${NEWEST_VERSION}
+    git checkout ${NEWEST_VERSION} || ( echo '[!] Failed to change to newest tag'; exit 1 )
+
+    echo '[*] We are on this branch/tag right now:';
+    git branch
+
+    cd ${SCRIPT_DIR}/docker || ( echo '[!] Failed to change working directory to docker'; exit 1 )
+
+    echo '[*] Build and push "release"' ${NEWEST_VERSION} 'image tag (also update latest tag to it)'
+    (
+        make clean && \
+        make build && \
+        podman push localhost/chrislusf/seaweedfs:local ${REMOTE_IMAGE}:${NEWEST_VERSION} && \
+        podman push localhost/chrislusf/seaweedfs:local ${REMOTE_IMAGE}:latest \
+    ) || ( echo '[!] Failed to build and push release/latest image tag'; exit 1 )
+
+    echo ${NEWEST_VERSION} > ../build/.latest_successful_release_container_build
+fi
+
+echo '[*] Change to master branch to update "dev" image tag'
 git checkout master
 
 echo '[*] Build and push "dev" image tag'
