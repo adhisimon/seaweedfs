@@ -72,7 +72,7 @@ func (pages *ChunkedDirtyPages) saveChunkedFileIntervalToStorage(reader io.Reade
 
 	fileFullPath := pages.fh.FullPath()
 	fileName := fileFullPath.Name()
-	chunk, err := pages.fh.wfs.saveDataAsChunk(fileFullPath)(reader, fileName, offset, modifiedTsNs)
+	chunk, err := pages.fh.wfs.saveDataAsChunk(fileFullPath)(reader, fileName, offset, modifiedTsNs, uint64(size))
 	if err != nil {
 		glog.V(0).Infof("%v saveToStorage [%d,%d): %v", fileFullPath, offset, offset+size, err)
 		pages.lastErr = err
@@ -86,6 +86,14 @@ func (pages *ChunkedDirtyPages) saveChunkedFileIntervalToStorage(reader io.Reade
 
 func (pages *ChunkedDirtyPages) Destroy() {
 	pages.uploadPipeline.Shutdown()
+}
+
+func (pages *ChunkedDirtyPages) EvictOneWritableChunk() bool {
+	return pages.uploadPipeline.EvictOneWritableChunk()
+}
+
+func (pages *ChunkedDirtyPages) ProactiveFlush(nowNs, idleThresholdNs, maxHoldNs, fillRatio int64, frontierLag int, isSequential bool) bool {
+	return pages.uploadPipeline.ProactiveFlush(nowNs, idleThresholdNs, maxHoldNs, fillRatio, frontierLag, isSequential)
 }
 
 func (pages *ChunkedDirtyPages) LockForRead(startOffset, stopOffset int64) {

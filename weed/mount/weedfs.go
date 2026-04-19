@@ -82,6 +82,16 @@ type Option struct {
 	RdmaMaxConcurrent int
 	RdmaTimeoutMs     int
 
+	// Peer chunk sharing options (design-weed-mount-peer-chunk-sharing.md).
+	// When PeerEnabled is false (default), the mount runs exactly as today.
+	// One gRPC port carries everything: directory RPCs (ChunkAnnounce /
+	// ChunkLookup) and streaming FetchChunk byte transfers.
+	PeerEnabled    bool
+	PeerListen     string // host:port to bind the peer gRPC server
+	PeerAdvertise  string // externally reachable host:port (optional; defaults to auto-detected host + PeerListen port)
+	PeerDataCenter string // optional data-center label advertised to peers
+	PeerRack       string // optional rack label advertised to peers (finer than DC)
+
 	// Directory cache refresh/eviction controls
 	DirIdleEvictSec int
 
@@ -129,6 +139,12 @@ type WFS struct {
 	hardLinkLockTable    *util.LockTable[string]
 	posixLocks           *PosixLockTable
 	rdmaClient           *RDMAMountClient
+	peerRegistrar        *PeerRegistrar
+	peerDirectory        *PeerDirectory
+	peerGrpcServer       *PeerGrpcServer
+	peerAnnouncer        *PeerAnnouncer
+	peerConnPool         *PeerConnPool
+	peerDirectoryStop    chan struct{} // closed on unmount to stop the sweeper goroutine
 	FilerConf            *filer.FilerConf
 	filerClient          *wdclient.FilerClient // Cached volume location client
 	refreshMu            sync.Mutex
@@ -142,7 +158,14 @@ type WFS struct {
 	dirHotWindow         time.Duration
 	dirHotThreshold      int
 	dirIdleEvict         time.Duration
-	fileIdPool           *FileIdPool
+
+	// openMtimeCache maps inode -> [mtime_sec, mtime_ns] from the last Open.
+	// Used to decide whether to set FOPEN_KEEP_CACHE on subsequent opens.
+	// Bounded to openMtimeCacheMaxSize entries; when full a random entry is
+	// evicted. This trades a small amount of cache-miss overhead for
+	// predictable memory usage on mounts that touch many files.
+	openMtimeMu    sync.Mutex
+	openMtimeCache map[uint64][2]int64
 
 	// asyncFlushWg tracks pending background flush work items for writebackCache mode.
 	// Must be waited on before unmount cleanup to prevent data loss.
@@ -221,6 +244,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		posixLocks:        NewPosixLockTable(),
 		refreshingDirs:    make(map[util.FullPath]struct{}),
 		atimeMap:          make(map[uint64]time.Time, 8192),
+		openMtimeCache:    make(map[uint64][2]int64, 8192),
 		dirMtimeMap:       make(map[uint64]time.Time, 1024),
 		entryValidSec:    1,
 		attrValidSec:     1,
@@ -251,6 +275,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 	}
 	if option.WriteBufferSizeMB > 0 {
 		wfs.writeBufferAccountant = page_writer.NewWriteBufferAccountant(option.WriteBufferSizeMB * 1024 * 1024)
+		wfs.writeBufferAccountant.SetEvictor(wfs.evictOneWritableChunk)
 	}
 
 	wfs.metaCache = meta_cache.NewMetaCache(path.Join(option.getUniqueCacheDirForRead(), "meta"), option.UidGidMapper,
@@ -317,6 +342,26 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		if wfs.rdmaClient != nil {
 			wfs.rdmaClient.Close()
 		}
+		if wfs.peerAnnouncer != nil {
+			wfs.peerAnnouncer.Stop()
+		}
+		if wfs.peerConnPool != nil {
+			wfs.peerConnPool.Close()
+		}
+		if wfs.peerGrpcServer != nil {
+			wfs.peerGrpcServer.Stop()
+		}
+		if wfs.peerDirectoryStop != nil {
+			select {
+			case <-wfs.peerDirectoryStop:
+				// already closed
+			default:
+				close(wfs.peerDirectoryStop)
+			}
+		}
+		if wfs.peerRegistrar != nil {
+			wfs.peerRegistrar.Stop()
+		}
 	})
 
 	// Initialize RDMA client if enabled
@@ -333,6 +378,90 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 			wfs.rdmaClient = rdmaClient
 			glog.Infof("RDMA acceleration enabled: sidecar=%s, maxConcurrent=%d, timeout=%dms",
 				option.RdmaSidecarAddr, option.RdmaMaxConcurrent, option.RdmaTimeoutMs)
+		}
+	}
+
+	// Peer chunk sharing: register with every configured filer's mount
+	// registry + start the single gRPC server that handles ChunkAnnounce /
+	// ChunkLookup / FetchChunk. Broadcasting registration to the full
+	// filer set is what lets mounts pointing at different filers see
+	// each other — each filer's registry is in-memory with no
+	// filer-to-filer sync, so the registrar reconstructs the union
+	// client-side. One port, one identity — the advertise address
+	// resolved in PR #3 is used for everything.
+	if option.PeerEnabled {
+		selfAddr, err := ResolvePeerAdvertiseAddr(option.PeerListen, option.PeerAdvertise)
+		if err != nil {
+			// Downstream code treats PeerEnabled as "peer infrastructure
+			// is ready": later PRs wire the gRPC server, fetcher hook,
+			// and announcer from this flag. If we can't resolve a
+			// reachable self-address those components would nil-deref
+			// or advertise garbage, so disable the feature instead of
+			// limping along half-initialized.
+			glog.Warningf("peer: cannot resolve advertise addr, disabling peer sharing: %v", err)
+			option.PeerEnabled = false
+		} else {
+			dial := func(ctx context.Context, addr pb.ServerAddress, fn func(client filer_pb.SeaweedFilerClient) error) error {
+				return pb.WithGrpcFilerClient(false, 0, addr, option.GrpcDialOption, fn)
+			}
+			wfs.peerRegistrar = NewPeerRegistrar(option.FilerAddresses, dial, selfAddr, option.PeerDataCenter, option.PeerRack)
+			if err := wfs.peerRegistrar.Start(context.Background()); err != nil {
+				glog.Warningf("peer registrar start: %v", err)
+			}
+
+			wfs.peerDirectory = NewPeerDirectory()
+			// Wire TLS/mTLS from security.toml's grpc.mount section so
+			// cross-host peer RPCs are authenticated + encrypted. When
+			// the section is empty both options come back nil and the
+			// server runs plaintext — intentional for dev/test.
+			peerTLSCreds, peerTLSVerify := security.LoadServerTLS(util.GetViper(), "grpc.mount")
+			var peerServerOpts []grpc.ServerOption
+			if peerTLSCreds != nil {
+				peerServerOpts = append(peerServerOpts, peerTLSCreds)
+			}
+			if peerTLSVerify != nil {
+				peerServerOpts = append(peerServerOpts, peerTLSVerify)
+			}
+			wfs.peerGrpcServer = NewPeerGrpcServer(
+				wfs.chunkCache,
+				wfs.peerDirectory,
+				wfs.peerRegistrar.OwnerFor,
+				selfAddr,
+				peerServerOpts...,
+			)
+			if err := wfs.peerGrpcServer.Start(option.PeerListen); err != nil {
+				glog.Warningf("peer grpc start: %v", err)
+				wfs.peerGrpcServer = nil
+			} else {
+				wfs.peerDirectoryStop = make(chan struct{})
+				go wfs.runPeerDirectorySweeper(wfs.peerDirectoryStop)
+
+				// Shared connection pool + announcer. Pool reuses one
+				// grpc.ClientConn per owner mount across both the
+				// announcer flush and the fetcher's ChunkLookup +
+				// FetchChunk calls. Transport credentials come from
+				// option.GrpcDialOption (security.LoadClientTLS), so
+				// peer dials match the TLS posture the server wants.
+				wfs.peerConnPool = NewPeerConnPool(option.GrpcDialOption)
+				wfs.peerAnnouncer = NewPeerAnnouncer(
+					selfAddr,
+					option.PeerDataCenter,
+					option.PeerRack,
+					wfs.peerRegistrar.OwnerFor,
+					wfs.peerConnPool.Dialer(),
+					wfs.peerDirectory,
+				)
+				// Close the write→announce race: between SetChunk and
+				// the flush tick (up to 15 s) the cache can LRU-evict
+				// the chunk. Skip announcing fids we no longer hold.
+				if wfs.chunkCache != nil {
+					cache := wfs.chunkCache
+					wfs.peerAnnouncer.SetCachePresence(func(fid string) bool {
+						return cache.IsInCache(fid, true)
+					})
+				}
+				wfs.peerAnnouncer.Start()
+			}
 		}
 	}
 
@@ -375,11 +504,7 @@ func (wfs *WFS) StartBackgroundTasks() error {
 	go wfs.loopCheckQuota()
 	go wfs.loopFlushDirtyMetadata()
 	go wfs.loopEvictIdleDirCache()
-
-	if wfs.option.WritebackCache {
-		wfs.fileIdPool = NewFileIdPool(wfs)
-		glog.V(0).Infof("file ID pool enabled for writeback cache (batch=%d)", wfs.fileIdPool.batchSize)
-	}
+	go wfs.loopProactiveFlush()
 
 	return nil
 }
