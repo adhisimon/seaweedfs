@@ -15,8 +15,6 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
-	"google.golang.org/grpc/credentials/tls/certprovider"
-	"google.golang.org/grpc/credentials/tls/certprovider/pemfile"
 	"google.golang.org/grpc/reflection"
 
 	"github.com/seaweedfs/seaweedfs/weed/credential"
@@ -82,9 +80,7 @@ type FilerOptions struct {
 	allowedOrigins            *string
 	exposeDirectoryData       *bool
 	tusBasePath               *string
-	certProvider              certprovider.Provider
 	s3ConfigFile              *string // optional path to static S3 identity config
-	mountPeerRegistryEnable        *bool   // accept MountRegister/MountList RPCs (peer chunk sharing tier 1)
 	// shutdownCtx, when non-nil, tells startFiler to gracefully shut down its
 	// HTTP/gRPC servers once the ctx is cancelled. Used by integration tests
 	// and by weed mini; nil for standalone weed filer.
@@ -127,7 +123,6 @@ func init() {
 	f.allowedOrigins = cmdFiler.Flag.String("allowedOrigins", "*", "comma separated list of allowed origins")
 	f.exposeDirectoryData = cmdFiler.Flag.Bool("exposeDirectoryData", true, "whether to return directory metadata and content in Filer UI")
 	f.tusBasePath = cmdFiler.Flag.String("tusBasePath", "/.tus", "TUS resumable upload endpoint base path (e.g., /.tus)")
-	f.mountPeerRegistryEnable = cmdFiler.Flag.Bool("mount.p2p", true, "accept MountRegister/MountList RPCs from weed mount clients for peer chunk sharing (tier 1). Idle cost is near-zero; set false to disable.")
 
 	// start s3 on filer
 	filerStartS3 = cmdFiler.Flag.Bool("s3", false, "whether to start S3 gateway")
@@ -315,15 +310,6 @@ func runFiler(cmd *Command, args []string) bool {
 	return true
 }
 
-// GetCertificateWithUpdate Auto refreshing TSL certificate
-func (fo *FilerOptions) GetCertificateWithUpdate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-	certs, err := fo.certProvider.KeyMaterial(context.Background())
-	if certs == nil {
-		return nil, err
-	}
-	return &certs.Certs[0], err
-}
-
 func (fo *FilerOptions) startFiler() {
 
 	defaultMux := http.NewServeMux()
@@ -388,7 +374,6 @@ func (fo *FilerOptions) startFiler() {
 		AllowedOrigins:            strings.Split(*fo.allowedOrigins, ","),
 		TusBasePath:               *fo.tusBasePath,
 		CredentialManager:         credentialManager,
-		MountPeerRegistryEnabled:       fo.mountPeerRegistryEnable != nil && *fo.mountPeerRegistryEnable,
 	})
 	if nfs_err != nil {
 		glog.Fatalf("Filer startup error: %v", nfs_err)
@@ -500,14 +485,11 @@ func (fo *FilerOptions) startFiler() {
 		caCertFile := viper.GetString("https.filer.ca")
 		disbaleTlsVerifyClientCert := viper.GetBool("https.filer.disable_tls_verify_client_cert")
 
-		pemfileOptions := pemfile.Options{
-			CertFile:        certFile,
-			KeyFile:         keyFile,
-			RefreshDuration: security.CredRefreshingInterval,
+		getCert, certProvider, err := security.NewReloadingServerCertificate(certFile, keyFile)
+		if err != nil {
+			glog.Fatalf("Filer failed to load HTTPS certificate: %v", err)
 		}
-		if fo.certProvider, err = pemfile.NewProvider(pemfileOptions); err != nil {
-			glog.Fatalf("pemfile.NewProvider(%v) failed: %v", pemfileOptions, err)
-		}
+		defer certProvider.Close()
 
 		caCertPool := x509.NewCertPool()
 		if caCertFile != "" {
@@ -524,12 +506,15 @@ func (fo *FilerOptions) startFiler() {
 		}
 
 		tlsConfig := &tls.Config{
-			GetCertificate: fo.GetCertificateWithUpdate,
+			GetCertificate: getCert,
 			ClientAuth:     clientAuth,
 			ClientCAs:      caCertPool,
 		}
 
-		security.FixTlsConfig(util.GetViper(), tlsConfig)
+		err = security.FixTlsConfig(util.GetViper(), tlsConfig)
+		if err != nil {
+			glog.Fatalf("Filer failed to fix TLS config: %v", err)
+		}
 
 		var localTLSServer *http.Server
 		if filerLocalListener != nil {
@@ -552,10 +537,16 @@ func (fo *FilerOptions) startFiler() {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			if socketServer != nil {
-				socketServer.Shutdown(shutdownCtx)
+				err = socketServer.Shutdown(shutdownCtx)
+				if err != nil {
+					glog.Warningf("socket server shutdown: %v", err)
+				}
 			}
 			if localTLSServer != nil {
-				localTLSServer.Shutdown(shutdownCtx)
+				err = localTLSServer.Shutdown(shutdownCtx)
+				if err != nil {
+					glog.Warningf("local TLS server shutdown: %v", err)
+				}
 			}
 			if err := httpS.Shutdown(shutdownCtx); err != nil {
 				glog.Warningf("HTTPS server shutdown: %v", err)

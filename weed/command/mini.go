@@ -82,11 +82,11 @@ var (
 //     goroutines (registered via onMiniClientsShutdown / trackMiniClient) to
 //     drain.
 type miniClientsState struct {
-	ctx           context.Context
-	cancel        context.CancelFunc
-	wg            sync.WaitGroup
-	preCancelMu   sync.Mutex
-	preCancelFns  []func()
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	preCancelMu  sync.Mutex
+	preCancelFns []func()
 }
 
 var miniClients *miniClientsState
@@ -311,7 +311,6 @@ func initMiniFilerFlags() {
 	miniFilerOptions.allowedOrigins = cmdMini.Flag.String("filer.allowedOrigins", "*", "comma separated list of allowed origins")
 	miniFilerOptions.exposeDirectoryData = cmdMini.Flag.Bool("filer.exposeDirectoryData", true, "whether to return directory metadata and content in Filer UI")
 	miniFilerOptions.tusBasePath = cmdMini.Flag.String("filer.tusBasePath", "/.tus", "TUS resumable upload endpoint base path")
-	miniFilerOptions.mountPeerRegistryEnable = cmdMini.Flag.Bool("filer.mount.p2p", true, "accept MountRegister/MountList RPCs from weed mount clients for peer chunk sharing (tier 1). Idle cost is near-zero; set false to disable.")
 }
 
 // initMiniVolumeFlags initializes Volume server flag options
@@ -808,8 +807,11 @@ func applyConfigFileOptions(options map[string]string) {
 		if flag != nil {
 			// Only set if not already set (by command line)
 			if flag.Value.String() == flag.DefValue {
-				flag.Value.Set(value)
-				glog.V(2).Infof("Applied config file option: %s=%s", key, value)
+				if err := flag.Value.Set(value); err != nil {
+					glog.Warningf("Failed to apply config file option: %s=%s: %v", key, value, err)
+				} else {
+					glog.V(2).Infof("Applied config file option: %s=%s", key, value)
+				}
 			}
 		}
 	}
@@ -1022,7 +1024,9 @@ func runMini(cmd *Command, args []string) bool {
 	printWelcomeMessage()
 
 	// Save configuration to file for persistence and documentation
-	saveMiniConfiguration(*miniDataFolders)
+	if err := saveMiniConfiguration(*miniDataFolders); err != nil {
+		glog.Warningf("failed to save mini configuration in %s: %v", *miniDataFolders, err)
+	}
 
 	if MiniClusterCtx != nil {
 		<-MiniClusterCtx.Done()

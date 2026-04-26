@@ -5,6 +5,8 @@ package s3api
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -408,32 +410,61 @@ func (e *EmbeddedIamApi) CreateAccessKey(s3cfg *iam_pb.S3ApiConfiguration, value
 	userName := values.Get("UserName")
 	status := iam.StatusTypeActive
 
-	// Generate AWS-standard access key: AKIA prefix + 16 random uppercase chars = 20 total
-	randomPart, err := iamStringWithCharset(AccessKeyLength-len(UserAccessKeyPrefix), iamCharsetUpper)
-	if err != nil {
-		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("failed to generate access key: %w", err)}
+	accessKeyId := values.Get("AccessKeyId")
+	secretAccessKey := values.Get("SecretAccessKey")
+	if accessKeyId != "" {
+		if err := iamlib.ValidateCallerSuppliedAccessKeyId(accessKeyId); err != nil {
+			return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: err}
+		}
 	}
-	accessKeyId := UserAccessKeyPrefix + randomPart
-
-	secretAccessKey, err := iamStringWithCharset(SecretKeyLength, iamCharset)
-	if err != nil {
-		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("failed to generate secret key: %w", err)}
+	if secretAccessKey != "" {
+		if err := iamlib.ValidateCallerSuppliedSecretAccessKey(secretAccessKey); err != nil {
+			return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: err}
+		}
+	}
+	if (accessKeyId != "") != (secretAccessKey != "") {
+		return resp, &iamError{Code: iam.ErrCodeInvalidInputException, Error: fmt.Errorf("AccessKeyId and SecretAccessKey must be supplied together")}
 	}
 
+	// Find the target user before touching the RNG or scanning for collisions,
+	// so a missing user fails fast without consuming entropy.
+	var target *iam_pb.Identity
+	for _, ident := range s3cfg.Identities {
+		if userName == ident.Name {
+			target = ident
+			break
+		}
+	}
+	if target == nil {
+		return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf(iamUserDoesNotExist, userName)}
+	}
+
+	if owner := iamlib.FindAccessKeyOwner(s3cfg, accessKeyId); owner != nil {
+		glog.V(4).Infof("CreateAccessKey: supplied AccessKeyId already in use by %s %s", owner.Type, owner.Name)
+		return resp, &iamError{Code: iam.ErrCodeEntityAlreadyExistsException, Error: fmt.Errorf("AccessKeyId is already in use")}
+	}
+	if accessKeyId == "" {
+		randomPart, err := iamStringWithCharset(AccessKeyLength-len(UserAccessKeyPrefix), iamCharsetUpper)
+		if err != nil {
+			return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("failed to generate access key: %w", err)}
+		}
+		accessKeyId = UserAccessKeyPrefix + randomPart
+	}
+	if secretAccessKey == "" {
+		var err error
+		secretAccessKey, err = iamStringWithCharset(SecretKeyLength, iamCharset)
+		if err != nil {
+			return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("failed to generate secret key: %w", err)}
+		}
+	}
 	resp.CreateAccessKeyResult.AccessKey.AccessKeyId = &accessKeyId
 	resp.CreateAccessKeyResult.AccessKey.SecretAccessKey = &secretAccessKey
 	resp.CreateAccessKeyResult.AccessKey.UserName = &userName
 	resp.CreateAccessKeyResult.AccessKey.Status = &status
 
-	for _, ident := range s3cfg.Identities {
-		if userName == ident.Name {
-			ident.Credentials = append(ident.Credentials,
-				&iam_pb.Credential{AccessKey: accessKeyId, SecretKey: secretAccessKey, Status: iamAccessKeyStatusActive})
-			return resp, nil
-		}
-	}
-	// User not found - return error instead of implicitly creating the user
-	return resp, &iamError{Code: iam.ErrCodeNoSuchEntityException, Error: fmt.Errorf(iamUserDoesNotExist, userName)}
+	target.Credentials = append(target.Credentials,
+		&iam_pb.Credential{AccessKey: accessKeyId, SecretKey: secretAccessKey, Status: iamAccessKeyStatusActive})
+	return resp, nil
 }
 
 // DeleteAccessKey deletes an access key for a user.
@@ -788,9 +819,18 @@ func (e *EmbeddedIamApi) getActions(policy *policy_engine.PolicyDocument) ([]str
 			return nil, fmt.Errorf("not a valid effect: '%s'. Only 'Allow' is possible", statement.Effect)
 		}
 		for _, resource := range statement.Resource.Strings() {
-			res := strings.Split(resource, ":")
-			if len(res) != 6 || res[0] != "arn" || res[1] != "aws" || res[2] != "s3" {
-				continue
+			// AWS IAM treats a bare "*" as "any resource". Normalize it to the
+			// full-wildcard S3 ARN so it flows through the same path as
+			// "arn:aws:s3:::*" instead of being dropped as malformed.
+			var resourcePath string
+			if resource == "*" {
+				resourcePath = "*"
+			} else {
+				res := strings.Split(resource, ":")
+				if len(res) != 6 || res[0] != "arn" || res[1] != "aws" || res[2] != "s3" {
+					continue
+				}
+				resourcePath = res[5]
 			}
 			for _, action := range statement.Action.Strings() {
 				act := strings.Split(action, ":")
@@ -802,7 +842,6 @@ func (e *EmbeddedIamApi) getActions(policy *policy_engine.PolicyDocument) ([]str
 					return nil, fmt.Errorf("not a valid action: '%s'", act[1])
 				}
 
-				resourcePath := res[5]
 				if resourcePath == "*" {
 					// Wildcard - applies to all buckets
 					actions = append(actions, statementAction)
@@ -1387,12 +1426,25 @@ func (e *EmbeddedIamApi) CreateServiceAccount(s3cfg *iam_pb.S3ApiConfiguration, 
 		}
 	}
 
-	// Generate unique ID and credentials
-	saId, err := iamStringWithCharset(ServiceAccountIDLength, iamCharsetUpper)
-	if err != nil {
+	// Generate a unique service account ID in the format required by
+	// credential.ValidateServiceAccountId: sa:<parent>:<uuid>. 16 bytes of
+	// randomness (hex-encoded) matches the shell command's generator.
+	var idBytes [16]byte
+	if _, err := rand.Read(idBytes[:]); err != nil {
 		return resp, &iamError{Code: iam.ErrCodeServiceFailureException, Error: fmt.Errorf("failed to generate ID: %w", err)}
 	}
-	saId = ServiceAccountIDPrefix + "-" + saId
+	saId := fmt.Sprintf("%s:%s:%s", ServiceAccountIDPrefix, parentUser, hex.EncodeToString(idBytes[:]))
+
+	// Fail closed if the generated ID wouldn't pass the persistence-layer
+	// validator — better a 400 here than an opaque 500 at save time. This
+	// guards against parent-user values that slipped past earlier
+	// validation (e.g., containing `:` or whitespace).
+	if err := credential.ValidateServiceAccountId(saId); err != nil {
+		return resp, &iamError{
+			Code:  iam.ErrCodeInvalidInputException,
+			Error: fmt.Errorf("generated invalid service account ID %q: %w", saId, err),
+		}
+	}
 
 	// Generate access key ID with correct length (20 chars total including prefix)
 	// AWS access keys are always 20 characters: 4-char prefix (ABIA) + 16 random chars
@@ -2087,7 +2139,7 @@ func (e *EmbeddedIamApi) ExecuteAction(ctx context.Context, values url.Values, s
 		return nil, &iamError{Code: s3err.GetAPIError(s3err.ErrInternalError).Code, Error: fmt.Errorf("failed to get s3 api configuration: %v", err)}
 	}
 
-	glog.V(4).Infof("IAM ExecuteAction: %+v", values)
+	glog.V(4).Infof("IAM ExecuteAction: %+v", iamlib.RedactSensitiveFormValues(values))
 	var response iamlib.RequestIDSetter
 	changed := true
 	switch values.Get("Action") {

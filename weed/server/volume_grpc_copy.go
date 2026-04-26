@@ -560,18 +560,44 @@ func (vs *VolumeServer) ReceiveFile(stream volume_server_pb.VolumeServer_Receive
 			glog.V(1).Infof("ReceiveFile: volume %d, ext %s, collection %s, shard %d, size %d",
 				fileInfo.VolumeId, fileInfo.Ext, fileInfo.Collection, fileInfo.ShardId, fileInfo.FileSize)
 
-			// Create file path based on file info
 			if fileInfo.IsEcVolume {
-				// Find storage location for EC shard
-				var targetLocation *storage.DiskLocation
-				for _, location := range vs.store.Locations {
-					if location.DiskType == types.HardDriveType {
-						targetLocation = location
-						break
-					}
+				// os.Create below truncates in place; a mounted EcVolume
+				// holds fds on the same inodes, so overwriting corrupts
+				// live readers.
+				if _, mounted := vs.store.FindEcVolume(needle.VolumeId(fileInfo.VolumeId)); mounted {
+					glog.Errorf("ReceiveFile: ec volume %d is mounted; refusing overwrite for %s", fileInfo.VolumeId, fileInfo.Ext)
+					return stream.SendAndClose(&volume_server_pb.ReceiveFileResponse{
+						Error: fmt.Sprintf("ec volume %d is mounted; unmount before ReceiveFile", fileInfo.VolumeId),
+					})
 				}
-				if targetLocation == nil && len(vs.store.Locations) > 0 {
-					targetLocation = vs.store.Locations[0] // Fall back to first available location
+
+				// disk_id=0 means "unset" (protobuf default), so auto-select
+				// mirrors VolumeEcShardsCopy: prefer a disk already holding
+				// this volume's shards, then any HDD, then any disk.
+				var targetLocation *storage.DiskLocation
+				if fileInfo.DiskId > 0 {
+					if fileInfo.DiskId >= uint32(len(vs.store.Locations)) {
+						glog.Errorf("ReceiveFile: invalid disk_id %d: only have %d disks", fileInfo.DiskId, len(vs.store.Locations))
+						return stream.SendAndClose(&volume_server_pb.ReceiveFileResponse{
+							Error: fmt.Sprintf("invalid disk_id %d: only have %d disks", fileInfo.DiskId, len(vs.store.Locations)),
+						})
+					}
+					targetLocation = vs.store.Locations[fileInfo.DiskId]
+				} else {
+					targetLocation = vs.store.FindFreeLocation(func(loc *storage.DiskLocation) bool {
+						_, found := loc.FindEcVolume(needle.VolumeId(fileInfo.VolumeId))
+						return found
+					})
+					if targetLocation == nil {
+						targetLocation = vs.store.FindFreeLocation(func(loc *storage.DiskLocation) bool {
+							return loc.DiskType == types.HardDriveType
+						})
+					}
+					if targetLocation == nil {
+						targetLocation = vs.store.FindFreeLocation(func(loc *storage.DiskLocation) bool {
+							return true
+						})
+					}
 				}
 				if targetLocation == nil {
 					glog.Errorf("ReceiveFile: no storage location available")
