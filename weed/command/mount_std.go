@@ -41,6 +41,8 @@ func runMount(cmd *Command, args []string) bool {
 		go http.ListenAndServe(fmt.Sprintf(":%d", *mountOptions.debugPort), nil)
 	}
 
+	*mountCpuProfile = util.ResolvePath(*mountCpuProfile)
+	*mountMemProfile = util.ResolvePath(*mountMemProfile)
 	grace.SetupProfiling(*mountCpuProfile, *mountMemProfile)
 	if *mountReadRetryTime < time.Second {
 		*mountReadRetryTime = time.Second
@@ -242,11 +244,21 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		fsName = "fuse"
 	}
 
+	maxBackground := 128
+	if option.fuseMaxBackground != nil && *option.fuseMaxBackground > 0 {
+		maxBackground = *option.fuseMaxBackground
+	}
+	congestionThreshold := 0
+	if option.fuseCongestionThreshold != nil && *option.fuseCongestionThreshold > 0 {
+		congestionThreshold = *option.fuseCongestionThreshold
+	}
+
 	// mount fuse
 	fuseMountOptions := &fuse.MountOptions{
 		AllowOther:               *option.allowOthers,
 		Options:                  option.extraOptions,
-		MaxBackground:            128,
+		MaxBackground:            maxBackground,
+		CongestionThreshold:      congestionThreshold,
 		MaxWrite:                 1024 * 1024 * 2,
 		MaxReadAhead:             1024 * 1024 * 2,
 		IgnoreSecurityLabels:     false,
@@ -310,9 +322,10 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		mountRoot = mountRoot[0 : len(mountRoot)-1]
 	}
 
-	cacheDirForWrite := *option.cacheDirForWrite
+	cacheDirForRead := util.ResolvePath(*option.cacheDirForRead)
+	cacheDirForWrite := util.ResolvePath(*option.cacheDirForWrite)
 	if cacheDirForWrite == "" {
-		cacheDirForWrite = *option.cacheDirForRead
+		cacheDirForWrite = cacheDirForRead
 	}
 
 	seaweedFileSystem := mount.NewSeaweedFileSystem(&mount.Option{
@@ -329,7 +342,7 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		ChunkSizeLimit:              int64(chunkSizeLimitMB) * 1024 * 1024,
 		ConcurrentWriters:           *option.concurrentWriters,
 		ConcurrentReaders:           *option.concurrentReaders,
-		CacheDirForRead:             *option.cacheDirForRead,
+		CacheDirForRead:             cacheDirForRead,
 		CacheSizeMBForRead:          *option.cacheSizeMBForRead,
 		CacheDirForWrite:            cacheDirForWrite,
 		WriteBufferSizeMB:           *option.writeBufferSizeMB,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -46,6 +47,9 @@ type Server struct {
 	newUploader        func() (chunkUploader, error)
 	withFilerClient    filerClientExecutor
 	withInternalClient internalClientExecutor
+
+	rootFSOnce sync.Once
+	rootFS     *seaweedFileSystem
 }
 
 func NewServer(option *Option) (*Server, error) {
@@ -98,6 +102,21 @@ func (s *Server) Start() error {
 		return fmt.Errorf("listen nfs on %s:%d: %w", s.option.BindIp, s.option.Port, err)
 	}
 
+	// MOUNT v3 over UDP runs alongside the TCP NFS listener on the same
+	// port. The kernel default for mountproto is UDP in many setups, so
+	// without this responder a plain `mount -t nfs <host>:<export> /mnt`
+	// gets EPROTONOSUPPORT during the MOUNT phase even though the TCP
+	// NFS path is fine.
+	mountUDP := newMountUDPServer(s.option.BindIp, s.option.Port, s)
+	if err := mountUDP.Start(); err != nil {
+		_ = listener.Close()
+		return fmt.Errorf("start mount udp: %w", err)
+	}
+	defer func() {
+		_ = mountUDP.Close()
+	}()
+	glog.V(0).Infof("MOUNT v3 UDP responder listening on %s:%d", s.option.BindIp, s.option.Port)
+
 	var portmap *portmapServer
 	if s.option.PortmapBind != "" {
 		portmap = newPortmapServer(s.option.PortmapBind, portmapPort, uint32(s.option.Port))
@@ -105,8 +124,8 @@ func (s *Server) Start() error {
 			_ = listener.Close()
 			return fmt.Errorf("start portmap: %w", pmErr)
 		}
-		glog.V(0).Infof("NFS portmap responder listening on %s:%d (NFS v3 tcp=%d, MOUNT v3 tcp=%d)",
-			s.option.PortmapBind, portmapPort, s.option.Port, s.option.Port)
+		glog.V(0).Infof("NFS portmap responder listening on %s:%d (NFS v3 tcp=%d, MOUNT v3 tcp=%d, MOUNT v3 udp=%d)",
+			s.option.PortmapBind, portmapPort, s.option.Port, s.option.Port, s.option.Port)
 		defer func() {
 			if portmap != nil {
 				_ = portmap.Close()
@@ -119,13 +138,18 @@ func (s *Server) Start() error {
 }
 
 // logMountHint prints a copy-pasteable Linux mount command so operators can
-// see at startup how to mount the export from a client. The go-nfs library
-// does not run portmap, so without -portmap.bind the client must bypass
-// portmap via -o port=,mountport=,proto=tcp,mountproto=tcp.
+// see at startup how to mount the export from a client.
+//
+// With -portmap.bind set, MOUNT is now answered over both TCP and UDP, so a
+// plain `mount -t nfs host:/export /mnt` works — there is no longer any
+// kernel-default mountproto path that fails. Without -portmap.bind the
+// client still has to bypass portmap entirely via the explicit
+// port=/mountport=/proto=/mountproto= options.
 func (s *Server) logMountHint() {
 	exportPath := string(s.exportRoot)
 	if s.option.PortmapBind != "" {
 		glog.V(0).Infof("mount example: mount -t nfs -o nfsvers=3,nolock <host>:%s <mountpoint>", exportPath)
+		glog.V(0).Infof("(MOUNT v3 is served over both TCP and UDP, so no mountproto override is needed.)")
 		return
 	}
 	glog.V(0).Infof("mount example (bypasses portmap): mount -t nfs -o nfsvers=3,nolock,noacl,port=%d,mountport=%d,proto=tcp,mountproto=tcp <host>:%s <mountpoint>",
@@ -143,6 +167,7 @@ func (s *Server) serve(listener net.Listener) error {
 			authorizer: s.clientAuthorizer,
 		}
 	}
+	listener = newVersionFilterListener(listener)
 
 	handler, err := s.newHandler()
 	if err != nil {
@@ -178,17 +203,28 @@ func (s *Server) newHandler() (*Handler, error) {
 	if s == nil {
 		return nil, errors.New("nfs server is not configured")
 	}
-	rootFS := newSeaweedFileSystem(s, s.exportRoot, s.sharedReaderCache)
-	if s.sharedReaderCache == nil {
-		s.sharedReaderCache = rootFS.readerCache
-	}
-	if s.chunkInvalidator == nil {
-		s.chunkInvalidator = s.sharedReaderCache
-	}
 	return &Handler{
 		server: s,
-		rootFS: rootFS,
+		rootFS: s.rootFilesystem(),
 	}, nil
+}
+
+// rootFilesystem returns a single seaweedFileSystem rooted at the
+// configured export, building it on first call. Both the TCP handler
+// (via newHandler) and the UDP MOUNT path use the same instance so
+// they share the chunk reader cache and don't reconstruct a wrapper
+// per request.
+func (s *Server) rootFilesystem() *seaweedFileSystem {
+	s.rootFSOnce.Do(func() {
+		s.rootFS = newSeaweedFileSystem(s, s.exportRoot, s.sharedReaderCache)
+		if s.sharedReaderCache == nil {
+			s.sharedReaderCache = s.rootFS.readerCache
+		}
+		if s.chunkInvalidator == nil {
+			s.chunkInvalidator = s.sharedReaderCache
+		}
+	})
+	return s.rootFS
 }
 
 func (s *Server) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
