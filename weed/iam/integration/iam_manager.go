@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/iam/policy"
 	"github.com/seaweedfs/seaweedfs/weed/iam/providers"
 	"github.com/seaweedfs/seaweedfs/weed/iam/sts"
@@ -27,10 +29,42 @@ type IAMManager struct {
 	policyEngine         *policy.PolicyEngine
 	roleStore            RoleStore
 	userStore            UserStore
+	oidcProviderStore    OIDCProviderStore
 	filerAddressProvider func() string // Function to get current filer address
 	initialized          bool
 	runtimePolicyMu      sync.Mutex
 	runtimePolicyNames   map[string]struct{}
+}
+
+// SetOIDCProviderStore configures the IAM-managed OIDC provider store. When
+// nil, OIDC provider IAM actions return ServiceNotReady. The store is the
+// source of truth for AssumeRoleWithWebIdentity provider resolution once
+// Phase 2b lands; in Phase 2a it is read-only and populated from static
+// configuration at boot.
+func (m *IAMManager) SetOIDCProviderStore(store OIDCProviderStore) {
+	m.oidcProviderStore = store
+}
+
+// GetOIDCProviderStore returns the configured store (may be nil).
+func (m *IAMManager) GetOIDCProviderStore() OIDCProviderStore {
+	return m.oidcProviderStore
+}
+
+// GetOIDCProvider returns the record for the given ARN, or an error if the
+// store is not configured or the record is missing.
+func (m *IAMManager) GetOIDCProvider(ctx context.Context, arn string) (*OIDCProviderRecord, error) {
+	if m.oidcProviderStore == nil {
+		return nil, fmt.Errorf("OIDC provider store not configured")
+	}
+	return m.oidcProviderStore.GetProviderByARN(ctx, m.getFilerAddress(), arn)
+}
+
+// ListOIDCProviders enumerates all configured OIDC providers.
+func (m *IAMManager) ListOIDCProviders(ctx context.Context) ([]*OIDCProviderRecord, error) {
+	if m.oidcProviderStore == nil {
+		return nil, fmt.Errorf("OIDC provider store not configured")
+	}
+	return m.oidcProviderStore.ListProviders(ctx, m.getFilerAddress())
 }
 
 // IAMConfig holds configuration for all IAM components
@@ -43,6 +77,17 @@ type IAMConfig struct {
 
 	// Role store configuration
 	Roles *RoleStoreConfig `json:"roleStore"`
+
+	// OIDCProviders configures the IAM-managed OIDC provider store. Optional;
+	// if absent the manager defaults to an in-memory store hydrated from
+	// STS.Providers at boot.
+	OIDCProviders *OIDCProviderStoreConfig `json:"oidcProviderStore,omitempty"`
+}
+
+// OIDCProviderStoreConfig holds OIDC provider store configuration.
+type OIDCProviderStoreConfig struct {
+	StoreType   string                 `json:"storeType"` // memory, filer
+	StoreConfig map[string]interface{} `json:"storeConfig,omitempty"`
 }
 
 // RoleStoreConfig holds role store configuration
@@ -75,6 +120,12 @@ type RoleDefinition struct {
 
 	// Description is an optional description of the role
 	Description string `json:"description,omitempty"`
+
+	// MaxSessionDuration is the upper bound (in seconds) on session length when
+	// callers assume this role. Zero means "use the global STS default". When
+	// set it must satisfy AWS bounds: 3600 ≤ MaxSessionDuration ≤ 43200.
+	// Honoured by AssumeRole, AssumeRoleWithWebIdentity, AssumeRoleWithCredentials.
+	MaxSessionDuration int64 `json:"maxSessionDuration,omitempty"`
 }
 
 // ActionRequest represents a request to perform an action
@@ -190,7 +241,107 @@ func (m *IAMManager) Initialize(config *IAMConfig, filerAddressProvider func() s
 	}
 	m.roleStore = roleStore
 
+	// Initialize OIDC provider store and hydrate from static configuration so
+	// the read-only IAM API can return the same providers the STS service
+	// already accepts. Mutations will land in Phase 2b.
+	if err := m.initOIDCProviderStore(config); err != nil {
+		return fmt.Errorf("failed to initialize OIDC provider store: %w", err)
+	}
+
 	m.initialized = true
+	return nil
+}
+
+// initOIDCProviderStore creates the OIDC provider store and seeds it from the
+// static STS provider configuration. The static path remains the bootstrap
+// source: each enabled OIDC entry under STS.Providers is mirrored as an
+// OIDCProviderRecord so the IAM API surfaces the same set the STS service
+// validates against.
+func (m *IAMManager) initOIDCProviderStore(config *IAMConfig) error {
+	store, err := m.createOIDCProviderStore(config.OIDCProviders)
+	if err != nil {
+		return err
+	}
+	m.oidcProviderStore = store
+
+	if config.STS == nil {
+		return nil
+	}
+	for _, pc := range config.STS.Providers {
+		if pc == nil || !pc.Enabled || pc.Type != sts.ProviderTypeOIDC {
+			continue
+		}
+		issuer, _ := pc.Config["issuer"].(string)
+		if issuer == "" {
+			glog.Warningf("OIDC provider %s in static config has empty issuer; skipping mirror to store", pc.Name)
+			continue
+		}
+		accountID := ""
+		if config.STS != nil {
+			accountID = config.STS.AccountId
+		}
+		arn, err := DeriveOIDCProviderARN(accountID, issuer)
+		if err != nil {
+			glog.Warningf("derive ARN for static OIDC provider %s: %v", pc.Name, err)
+			continue
+		}
+		clientIDs := extractClientIDs(pc.Config)
+		ctx := context.Background()
+		// Preserve CreatedAt across reboots when a persistent store already
+		// has this provider — IAM's GetOpenIDConnectProvider response
+		// shouldn't shift its CreateDate every time the server restarts.
+		now := time.Now().UTC()
+		createdAt := now
+		if existing, err := store.GetProviderByARN(ctx, m.getFilerAddress(), arn); err == nil && existing != nil && !existing.CreatedAt.IsZero() {
+			createdAt = existing.CreatedAt
+		}
+		rec := &OIDCProviderRecord{
+			AccountID: accountID,
+			ARN:       arn,
+			URL:       issuer,
+			ClientIDs: clientIDs,
+			CreatedAt: createdAt,
+			UpdatedAt: now,
+		}
+		if err := store.StoreProvider(ctx, m.getFilerAddress(), rec); err != nil {
+			glog.Warningf("mirror static OIDC provider %s into store: %v", pc.Name, err)
+		}
+	}
+	return nil
+}
+
+// createOIDCProviderStore selects an OIDCProviderStore implementation. Defaults
+// to memory; "filer" requires a filerAddressProvider to be configured.
+func (m *IAMManager) createOIDCProviderStore(cfg *OIDCProviderStoreConfig) (OIDCProviderStore, error) {
+	if cfg == nil || cfg.StoreType == "" || cfg.StoreType == "memory" {
+		return NewMemoryOIDCProviderStore(), nil
+	}
+	if cfg.StoreType == "filer" {
+		return NewFilerOIDCProviderStore(cfg.StoreConfig, m.filerAddressProvider), nil
+	}
+	return nil, fmt.Errorf("unsupported OIDC provider store type: %s", cfg.StoreType)
+}
+
+// extractClientIDs reads a single clientId or a clientIds list from the
+// provider's static config map. Mirrors the OIDCConfig schema.
+func extractClientIDs(cfg map[string]interface{}) []string {
+	if cfg == nil {
+		return nil
+	}
+	if list, ok := cfg["clientIds"].([]interface{}); ok {
+		out := make([]string, 0, len(list))
+		for _, v := range list {
+			if s, ok := v.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	if id, ok := cfg["clientId"].(string); ok && id != "" {
+		return []string{id}
+	}
 	return nil
 }
 
@@ -272,6 +423,13 @@ func (m *IAMManager) CreateRole(ctx context.Context, filerAddress string, roleNa
 		}
 	}
 
+	// Validate per-role MaxSessionDuration if specified. AWS bounds: 1h..12h.
+	if roleDef.MaxSessionDuration != 0 {
+		if roleDef.MaxSessionDuration < 3600 || roleDef.MaxSessionDuration > 43200 {
+			return fmt.Errorf("MaxSessionDuration must be between 3600 and 43200 seconds, got %d", roleDef.MaxSessionDuration)
+		}
+	}
+
 	// Store role definition
 	return m.roleStore.StoreRole(ctx, "", roleName, roleDef)
 }
@@ -329,8 +487,31 @@ func (m *IAMManager) AssumeRoleWithWebIdentity(ctx context.Context, request *sts
 		return nil, fmt.Errorf("trust policy validation failed: %w", err)
 	}
 
+	// Apply role-level MaxSessionDuration cap. The STS service still applies
+	// the global MaxSessionLength and the source-token-expiry cap on top of
+	// this; per-role takes precedence whenever it is the tightest bound.
+	request.DurationSeconds = capDurationByRole(request.DurationSeconds, roleDef.MaxSessionDuration)
+
 	// Use STS service to assume the role
 	return m.stsService.AssumeRoleWithWebIdentity(ctx, request)
+}
+
+// capDurationByRole returns the requested duration clamped to the role's
+// MaxSessionDuration. A nil requested duration is left nil so the STS
+// service's calculateSessionDuration applies the global default (typically
+// 1 hour) — substituting the role's max here would silently mint a 12h
+// session for any caller who omitted DurationSeconds, which AWS does not
+// do. The role-max upper bound still applies in the downstream cap chain
+// once the request has a concrete duration.
+func capDurationByRole(requested *int64, roleMax int64) *int64 {
+	if roleMax <= 0 || requested == nil {
+		return requested
+	}
+	if *requested > roleMax {
+		v := roleMax
+		return &v
+	}
+	return requested
 }
 
 // AssumeRoleWithCredentials assumes a role using credentials (LDAP)
@@ -352,6 +533,9 @@ func (m *IAMManager) AssumeRoleWithCredentials(ctx context.Context, request *sts
 	if err := m.validateTrustPolicyForCredentials(ctx, roleDef, request); err != nil {
 		return nil, fmt.Errorf("trust policy validation failed: %w", err)
 	}
+
+	// Apply role-level MaxSessionDuration cap.
+	request.DurationSeconds = capDurationByRole(request.DurationSeconds, roleDef.MaxSessionDuration)
 
 	// Use STS service to assume the role
 	return m.stsService.AssumeRoleWithCredentials(ctx, request)
@@ -450,13 +634,20 @@ func (m *IAMManager) IsActionAllowed(ctx context.Context, request *ActionRequest
 
 	var baseResult *policy.EvaluationResult
 	var err error
-	subjectPolicyCount := 0
+	// hasManagedSubject is true once we've resolved the principal to a registered
+	// IAM user or role (or the caller has supplied PolicyNames directly). For a
+	// managed subject, "no matching statement" must deny — the DefaultEffect=Allow
+	// fallback is only meant for the unmanaged zero-config startup case.
+	hasManagedSubject := false
 
 	if isAdmin {
 		// Admin always has base access allowed
 		baseResult = &policy.EvaluationResult{Effect: policy.EffectAllow}
 	} else {
 		policies := request.PolicyNames
+		if len(policies) > 0 {
+			hasManagedSubject = true
+		}
 		if len(policies) == 0 {
 			// Extract role name from principal ARN
 			roleName := utils.ExtractRoleNameFromPrincipal(request.Principal)
@@ -472,6 +663,7 @@ func (m *IAMManager) IsActionAllowed(ctx context.Context, request *ActionRequest
 				if err != nil || user == nil {
 					return false, fmt.Errorf("user not found for principal: %s (user=%s)", request.Principal, userName)
 				}
+				hasManagedSubject = true
 				policies = user.GetPolicyNames()
 			} else {
 				// Get role definition
@@ -480,11 +672,10 @@ func (m *IAMManager) IsActionAllowed(ctx context.Context, request *ActionRequest
 					return false, fmt.Errorf("role not found: %s", roleName)
 				}
 
+				hasManagedSubject = true
 				policies = roleDef.AttachedPolicies
 			}
 		}
-		subjectPolicyCount = len(policies)
-
 		if bucketPolicyName != "" {
 			// Enforce an upper bound on the number of policies to avoid excessive allocations
 			if len(policies) >= maxPoliciesForEvaluation {
@@ -508,10 +699,11 @@ func (m *IAMManager) IsActionAllowed(ctx context.Context, request *ActionRequest
 	}
 
 	// Zero-config IAM uses DefaultEffect=Allow to preserve open-by-default behavior
-	// for requests without any subject policies. Once a user or role has attached
-	// policies, "no matching statement" must fall back to deny so the attachment
-	// actually scopes access.
-	if subjectPolicyCount > 0 && len(baseResult.MatchingStatements) == 0 {
+	// for requests without any subject policies. Once we resolve the principal to
+	// a registered IAM user or role (or the caller hands us policy names),
+	// "no matching statement" must fall back to deny — otherwise a freshly
+	// created user with zero policies would inherit full access.
+	if hasManagedSubject && len(baseResult.MatchingStatements) == 0 {
 		return false, nil
 	}
 
